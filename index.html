@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="el">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>2-Password Encryptor (Single String, AES-GCM)</title>
+    <style>
+        :root {
+            font-family: system-ui, Arial, sans-serif;
+            color-scheme: light dark;
+        }
+
+        body {
+            max-width: 900px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+        }
+
+        h1 {
+            font-size: 1.2rem;
+        }
+
+        textarea,
+        input[type=password] {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .row {
+            display: grid;
+            gap: .75rem;
+            margin: 1rem 0;
+        }
+
+        .grid {
+            display: grid;
+            gap: .75rem;
+            grid-template-columns: 1fr 1fr;
+        }
+
+        button {
+            padding: .6rem 1rem;
+            border-radius: .5rem;
+            border: 1px solid #8884;
+            cursor: pointer;
+        }
+
+        .muted {
+            opacity: .85;
+            font-size: .9rem;
+        }
+
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
+        .ok {
+            color: #0a7;
+        }
+
+        .err {
+            color: #c33;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Κρυπτογράφηση κειμένου με 2 κωδικούς — Ένα μόνο κωδικοποιημένο string</h1>
+
+    <div class="row">
+        <label>Κείμενο (για κρυπτογράφηση) ή Κωδικοποιημένο string (για αποκρυπτογράφηση):</label>
+        <textarea id="input" rows="10"
+            placeholder="Γράψε εδώ το κείμενο για κρυπτογράφηση ή επικόλλησε το κωδικοποιημένο string"></textarea>
+    </div>
+
+    <div class="grid">
+        <div>
+            <label>Password A</label>
+            <input id="pwA" type="password" autocomplete="current-password">
+        </div>
+        <div>
+            <label>Password B</label>
+            <input id="pwB" type="password" autocomplete="current-password">
+        </div>
+    </div>
+
+    <div class="grid">
+        <button id="btnEnc">🔒 Κρυπτογράφηση</button>
+        <button id="btnDec">🔓 Αποκρυπτογράφηση</button>
+    </div>
+
+    <div class="row">
+        <label>Αποτέλεσμα (single string):</label>
+        <textarea id="output" class="mono" rows="10" readonly
+            placeholder="Εδώ θα εμφανιστεί το ένα και μοναδικό κωδικοποιημένο string ή το απλό κείμενο μετά από αποκρυπτογράφηση"></textarea>
+        <div class="grid">
+            <button id="btnCopy">📋 Αντιγραφή</button>
+            <button id="btnClear">🧹 Καθαρισμός</button>
+        </div>
+        <div id="status" class="muted"></div>
+    </div>
+
+    <script>
+        (function () {
+            const enc = new TextEncoder();
+            const dec = new TextDecoder();
+
+            const $ = s => document.querySelector(s);
+            const input = $('#input'), output = $('#output');
+            const pwA = $('#pwA'), pwB = $('#pwB'), status = $('#status');
+
+            // Base64url helpers (χωρίς padding)
+            const b64u = {
+                to(u8) {
+                    let s = '';
+                    for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+                    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+                },
+                from(s) {
+                    s = s.replace(/-/g, '+').replace(/_/g, '/');
+                    // επαναφορά padding
+                    const pad = s.length % 4;
+                    if (pad) s += '='.repeat(4 - pad);
+                    const bin = atob(s);
+                    const u8 = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+                    return u8;
+                }
+            };
+
+            function ui(msg, ok = true) { status.textContent = msg; status.className = 'muted ' + (ok ? 'ok' : 'err'); }
+            function combine(a, b) { return enc.encode(String(a ?? '') + '\u0000' + String(b ?? '')); }
+
+            async function deriveKey(passBytes, salt, iterations) {
+                const baseKey = await crypto.subtle.importKey('raw', passBytes, { name: 'PBKDF2' }, false, ['deriveKey']);
+                return crypto.subtle.deriveKey(
+                    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations },
+                    baseKey,
+                    { name: 'AES-GCM', length: 256 },
+                    false,
+                    ['encrypt', 'decrypt']
+                );
+            }
+
+            // Πακετάρισμα σε ένα binary blob:
+            // [ 1B version | 4B iterations (big-endian) | 16B salt | 12B iv | N bytes ciphertext+tag ]
+            function pack(version, iterations, salt, iv, ct) {
+                const header = new Uint8Array(1 + 4 + 16 + 12);
+                let o = 0;
+                header[o++] = version & 0xFF;
+                header[o++] = (iterations >>> 24) & 0xFF;
+                header[o++] = (iterations >>> 16) & 0xFF;
+                header[o++] = (iterations >>> 8) & 0xFF;
+                header[o++] = iterations & 0xFF;
+                header.set(salt, o); o += 16;
+                header.set(iv, o); o += 12;
+                const out = new Uint8Array(header.length + ct.length);
+                out.set(header, 0);
+                out.set(ct, header.length);
+                return out;
+            }
+
+            function unpack(u8) {
+                if (u8.length < 1 + 4 + 16 + 12 + 1) throw new Error('Μη έγκυρο μήκος.');
+                let o = 0;
+                const version = u8[o++];
+                const iterations = (u8[o++] << 24) | (u8[o++] << 16) | (u8[o++] << 8) | (u8[o++]);
+                const salt = u8.slice(o, o + 16); o += 16;
+                const iv = u8.slice(o, o + 12); o += 12;
+                const ct = u8.slice(o);
+                return { version, iterations, salt, iv, ct };
+            }
+
+            const DEFAULT_ITERS = 400000; // αύξησέ το αν θες μεγαλύτερο κόστος
+
+            $('#btnEnc').addEventListener('click', async () => {
+                try {
+                    if (!input.value) return ui('Δώσε κείμενο για κρυπτογράφηση.', false);
+                    if (!pwA.value || !pwB.value) return ui('Συμπλήρωσε και τους δύο κωδικούς.', false);
+
+                    const salt = crypto.getRandomValues(new Uint8Array(16));
+                    const iv = crypto.getRandomValues(new Uint8Array(12));
+                    const key = await deriveKey(combine(pwA.value, pwB.value), salt, DEFAULT_ITERS);
+
+                    const pt = enc.encode(input.value);
+                    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, pt));
+
+                    const blob = pack(1, DEFAULT_ITERS, salt, iv, ct);
+                    output.value = b64u.to(blob);
+                    ui('Έγινε κρυπτογράφηση.');
+                } catch (e) {
+                    console.error(e);
+                    ui('Σφάλμα κρυπτογράφησης: ' + e.message, false);
+                }
+            });
+
+            $('#btnDec').addEventListener('click', async () => {
+                try {
+                    if (!input.value) return ui('Επικόλλησε το κωδικοποιημένο string στο επάνω πεδίο.', false);
+                    if (!pwA.value || !pwB.value) return ui('Συμπλήρωσε και τους δύο κωδικούς.', false);
+
+                    const blob = b64u.from(input.value.trim());
+                    const { version, iterations, salt, iv, ct } = unpack(blob);
+                    if (version !== 1) throw new Error('Μη υποστηριζόμενη έκδοση.');
+
+                    const key = await deriveKey(combine(pwA.value, pwB.value), salt, iterations);
+                    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, ct);
+                    output.value = dec.decode(pt);
+                    ui('Έγινε αποκρυπτογράφηση.');
+                } catch (e) {
+                    console.error(e);
+                    ui('Αποτυχία αποκρυπτογράφησης (λάθος κωδικοί ή κατεστραμμένα δεδομένα).', false);
+                }
+            });
+
+            $('#btnCopy').addEventListener('click', async () => {
+                try { await navigator.clipboard.writeText(output.value || ''); ui('Αντιγράφηκε.'); }
+                catch { ui('Αποτυχία αντιγραφής.', false); }
+            });
+
+            $('#btnClear').addEventListener('click', () => { input.value = ''; output.value = ''; ui('Καθαρίστηκαν τα πεδία.'); });
+        })();
+    </script>
+</body>
+
+</html>
